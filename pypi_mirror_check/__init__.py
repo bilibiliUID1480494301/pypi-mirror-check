@@ -397,6 +397,7 @@ class Report:
                 "label": r.label,
                 "status": r.status,
                 "latest": r.latest,
+                "latest_source": "simple",  # simple 页可见的最大版本，非目标版本
                 "version_count": r.version_count,
                 "latency_ms": r.latency_ms,
                 "found": r.found,
@@ -522,8 +523,10 @@ def _check_one(
         remote = json_files()
         if remote:
             status = "caching"
+            index_note = f"索引仍为 {latest}；" if latest and latest != version else ""
             note = (
-                f"JSON 已有 {len(remote)} 个文件，simple 页"
+                index_note
+                + f"JSON 已有 {len(remote)} 个文件，simple 页"
                 + ("缺 " + ", ".join(missing) if missing else "尚未更新")
                 + "（CDN 缓存滞后，不是上传失败）"
             )
@@ -598,7 +601,7 @@ def render_table(report: Report) -> str:
     ]
     width = max([len(r.label) for r in report.results] + [4])
     lw = max([len(r.latest or "-") for r in report.results] + [8])
-    lines.append(f"{'镜像'.ljust(width)}  {'站点最新'.ljust(lw)}  状态    延迟     备注")
+    lines.append(f"{'镜像'.ljust(width)}  {'索引最新'.ljust(lw)}  状态    延迟     备注")
     for r in report.results:
         note = ""
         if r.error:
@@ -616,6 +619,8 @@ def render_table(report: Report) -> str:
             f"{r.label.ljust(width)}  {latest}  "
             f"{STATUS_LABEL.get(r.status, r.status):<6}  {latency:<8}  {note}"
         )
+    if any(r.latest and r.latest != report.version for r in report.results):
+        lines.append("（索引最新 = 该镜像 simple 页当前可见的最大版本，不是目标版本）")
     return "\n".join(lines)
 
 

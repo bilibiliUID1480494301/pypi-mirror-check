@@ -85,6 +85,7 @@ class MirrorCheckTest(unittest.TestCase):
             # 根索引可达、但没有这个包 → 应是 missing 而不是 error
             "/simple/pkg404/": (200, "<html></html>", "text/html"),
             "/simple/cdnlag/": (200, "<html></html>", "text/html"),
+            "/simple/behind/foo/": (200, simple_html({"foo-0.9.tar.gz": "d" * 64}), "text/html"),
             "/simple/multi/foo/": (
                 200,
                 simple_html({**FILES, "foo-0.9.tar.gz": "d" * 64}),
@@ -314,6 +315,20 @@ class MirrorCheckTest(unittest.TestCase):
         self.assertTrue(result.index_ok)
         self.assertIn("CDN 缓存", result.error)
 
+    def test_caching_note_mentions_stale_index_version(self) -> None:
+        mirror = pmc.Mirror(
+            "behind",
+            "Behind",
+            f"{self.base}/simple/behind/{{name}}/",
+            json=f"{self.base}/pypi/{{name}}/{{version}}/json",
+        )
+        result = self.run_check([mirror]).results[0]
+        self.assertEqual(result.status, "caching")
+        self.assertEqual(result.latest, "0.9")
+        self.assertIn("索引仍为 0.9", result.error)
+        table = pmc.render_table(self.run_check([mirror]))
+        self.assertIn("不是目标版本", table)
+
     def test_ok_report(self) -> None:
         report = self.run_check([self.mirror("ok", "ok")])
         self.assertTrue(report.ok)
@@ -347,7 +362,7 @@ class MirrorCheckTest(unittest.TestCase):
         table = pmc.render_table(report)
         self.assertIn("包 foo", table)
         self.assertIn("目标 1.0", table)
-        self.assertIn("站点最新", table)
+        self.assertIn("索引最新", table)
 
     def test_cli_list_mirrors_and_usage(self) -> None:
         self.assertEqual(pmc.main(["--list-mirrors"]), 0)
