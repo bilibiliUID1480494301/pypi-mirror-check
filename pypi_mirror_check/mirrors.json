@@ -5,7 +5,8 @@
       "key": "pypi",
       "label": "PyPI 官方",
       "simple": "https://pypi.org/simple/{name}/",
-      "official": true
+      "official": true,
+      "json": "https://pypi.org/pypi/{name}/{version}/json"
     },
     {
       "key": "tuna",

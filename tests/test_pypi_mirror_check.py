@@ -84,6 +84,7 @@ class MirrorCheckTest(unittest.TestCase):
             "/simple/boom/foo/": (500, "boom", "text/plain"),
             # 根索引可达、但没有这个包 → 应是 missing 而不是 error
             "/simple/pkg404/": (200, "<html></html>", "text/html"),
+            "/simple/cdnlag/": (200, "<html></html>", "text/html"),
             "/simple/multi/foo/": (
                 200,
                 simple_html({**FILES, "foo-0.9.tar.gz": "d" * 64}),
@@ -283,7 +284,7 @@ class MirrorCheckTest(unittest.TestCase):
         self.assertEqual(by["ok"].status, "ok")
         self.assertEqual(by["missing"].status, "missing")
         self.assertEqual(by["partial"].status, "partial")
-        self.assertEqual(by["badhash"].status, "partial")
+        self.assertEqual(by["badhash"].status, "integrity")
         self.assertEqual(by["badhash"].mismatched, ["foo-1.0.tar.gz"])
         self.assertIn(by["boom"].status, ("error", "missing"))
         self.assertFalse(report.ok)
@@ -300,6 +301,18 @@ class MirrorCheckTest(unittest.TestCase):
         self.assertEqual(dead.status, "error")
         self.assertFalse(dead.index_ok)
         self.assertIn("索引页", dead.error)
+
+    def test_caching_when_json_has_but_simple_lags(self) -> None:
+        mirror = pmc.Mirror(
+            "cdn",
+            "CDN",
+            f"{self.base}/simple/cdnlag/{{name}}/",
+            json=f"{self.base}/pypi/{{name}}/{{version}}/json",
+        )
+        result = self.run_check([mirror]).results[0]
+        self.assertEqual(result.status, "caching")
+        self.assertTrue(result.index_ok)
+        self.assertIn("CDN 缓存", result.error)
 
     def test_ok_report(self) -> None:
         report = self.run_check([self.mirror("ok", "ok")])

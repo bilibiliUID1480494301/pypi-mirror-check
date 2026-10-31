@@ -47,6 +47,34 @@ PyPI 官方       0.9.5     已同步  312ms
 - 目标版本的每个文件都必须在该镜像的 simple 页出现；
 - 页面里带 `#sha256=` 时逐个比对（截断/换源会被抓出来）；
 - 镜像不给 hash 时退化为「文件名存在」，除非 `--require-hash`。
+## 判定顺序：JSON 优先，simple 页交叉
+
+每个镜像按这个顺序判，避免把 CDN 缓存滞后误报成「没同步」：
+
+1. **JSON API**（镜像若配置了 `json` 模板；官方默认有）拿该版本的文件名 + `digests.sha256`；
+2. **simple 页**拿文件名 + `#sha256=` 片段；
+3. 两者交叉：
+
+| JSON | simple 页 | 结论 |
+|---|---|---|
+| 有 | 有，hash 一致 | **已同步** |
+| 有 | 无 / 缺文件 | **缓存中**（CDN 边缘未刷新），不是上传失败 |
+| 有 | 有，hash 不一致 | **校验不符**（源站数据不一致，值得报警） |
+| 无 | — | 缺失 / 索引不可达 |
+
+`--wait` 会把「缓存中」当成未完成继续轮询，直到 simple 页跟上。
+
+手工复核：
+
+```bash
+# JSON（更新通常比 simple 的 CDN 边缘快）
+curl -sS https://pypi.org/pypi/<pkg>/<ver>/json   | python -c "import sys,json;d=json.load(sys.stdin);[print(u['filename'],u['digests']['sha256'][:16],u['size']) for u in d['urls']]"
+# simple（看 #sha256=）
+curl -sS https://pypi.org/simple/<pkg>/ | grep -o '<pkg>-<ver>[^"]*#sha256=[a-f0-9]*'
+```
+
+> 刚上传后 simple 页短暂为空是 **CDN 缓存**，不是上传失败；用 JSON + sha256 双确认，别据此判失败。
+
 - **镜像返回 404 时再探一次根索引**：根索引可达 → 判「无此包」（missing）；
   根索引也失败 → 判「镜像不可用 / 路径不对」（error），不会把坏源误报成包缺失。
 

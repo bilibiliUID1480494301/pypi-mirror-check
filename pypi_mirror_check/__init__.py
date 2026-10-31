@@ -93,6 +93,9 @@ class Mirror:
     label: str
     simple: str  # 含 {name}
     official: bool = False
+    # 可选的 JSON API 模板（含 {name}/{version}）。有它才能在 simple 缺文件时
+    # 区分「CDN 缓存滞后」与「真的没同步」。
+    json: str = ""
 
 
 @dataclass(frozen=True)
@@ -134,9 +137,18 @@ def load_config(path: str | Path | None = None) -> Config:
         # 根索引探测依赖 {name} 在路径末尾；不在末尾的模板会被判成「站点不可用」。
         if not simple.rstrip("/").endswith("{name}"):
             raise ValueError(f"{source}: {key} 的 simple 必须以 {{name}} 结尾（尾随 / 可选）")
+        json_template = str(item.get("json") or "").strip()
+        if json_template and ("{name}" not in json_template or "{version}" not in json_template):
+            raise ValueError(f"{source}: {key} 的 json 必须同时含 {{name}} 与 {{version}}")
         seen.add(key)
         mirrors.append(
-            Mirror(key=key, label=label, simple=simple, official=bool(item.get("official")))
+            Mirror(
+                key=key,
+                label=label,
+                simple=simple,
+                official=bool(item.get("official")),
+                json=json_template,
+            )
         )
     return Config(official_json=official, mirrors=tuple(mirrors), source=source)
 
@@ -157,8 +169,10 @@ def _add_mirror(config: Config, spec: str) -> Config:
 # ---------------------------------------------------------------- HTTP
 
 
-def _fetch(url: str, timeout: float, retries: int = 2) -> tuple[bytes, float]:
-    """GET，返回 (body, 秒)。4xx 不重试，5xx/网络错误重试。"""
+def _fetch(
+    url: str, timeout: float, retries: int = 2, retry_404: bool = False
+) -> tuple[bytes, float]:
+    """GET，返回 (body, 秒)。5xx/网络错误重试；404 可选重试（CDN 边缘偶发）。"""
     last: Exception | None = None
     for attempt in range(retries + 1):
         started = time.perf_counter()
@@ -176,14 +190,25 @@ def _fetch(url: str, timeout: float, retries: int = 2) -> tuple[bytes, float]:
                 body = response.read()
             return body, time.perf_counter() - started
         except urllib.error.HTTPError as exc:
-            if exc.code < 500:
+            if exc.code >= 500 or (retry_404 and exc.code == 404):
+                last = exc
+            else:
                 raise
-            last = exc
         except (urllib.error.URLError, TimeoutError, OSError) as exc:
             last = exc
         if attempt < retries:
             time.sleep(0.4 * (attempt + 1))
     raise last or RuntimeError("请求失败")
+
+
+def _fetch_json(url: str, timeout: float) -> dict:
+    """取 JSON API（拿不到就给空 dict，绝不抛）。"""
+    try:
+        body, _ = _fetch(url, timeout)
+        data = json.loads(body.decode("utf-8"))
+    except Exception:  # noqa: BLE001
+        return {}
+    return data if isinstance(data, dict) else {}
 
 
 # ---------------------------------------------------------------- 官方源
@@ -418,17 +443,40 @@ def _probe_index(mirror: Mirror, timeout: float) -> bool:
 def _check_one(
     mirror: Mirror,
     package: str,
+    version: str,
     expected: dict[str, str | None],
     timeout: float,
     require_hash: bool,
     collect_versions: bool = False,
 ) -> MirrorResult:
     url = mirror.simple.format(name=package)
+
+    def json_files() -> dict[str, str | None]:
+        """镜像若支持 JSON API，返回该版本的文件表；不支持/取不到给空。"""
+        if not mirror.json:
+            return {}
+        data = _fetch_json(mirror.json.format(name=package, version=version), timeout)
+        out: dict[str, str | None] = {}
+        for item in data.get("urls") or []:
+            name = item.get("filename")
+            if name:
+                out[name] = (item.get("digests") or {}).get("sha256")
+        return out
+
     try:
-        body, elapsed = _fetch(url, timeout)
+        body, elapsed = _fetch(url, timeout, retry_404=True)
     except urllib.error.HTTPError as exc:
-        # 404/403：先看索引页在不在，能分清「无此包」与「路径不对/站点不可用」
+        # 404/403：先看索引页在不在，再用 JSON 二次确认（区分缓存滞后与真缺失）
         index_ok = _probe_index(mirror, timeout) if exc.code in (403, 404) else None
+        remote = json_files() if index_ok else {}
+        if remote:
+            return MirrorResult(
+                mirror.key,
+                mirror.label,
+                "caching",
+                error=f"JSON 已有 {len(remote)} 个文件，simple 页还没更新（CDN 缓存滞后）",
+                index_ok=True,
+            )
         status = "missing" if index_ok else "error"
         reason = "索引可达，但无此包" if index_ok else "索引页也不可达（路径或站点问题）"
         return MirrorResult(
@@ -455,14 +503,30 @@ def _check_one(
     ]
     hash_checked = sum(1 for name in found if available.get(name))
 
-    if not found:
+    note = ""
+    if mismatched:
+        # 文件在但内容不对：比「缺失」严重，单列一个状态
+        status = "integrity"
+        note = "sha256 与官方不一致：" + ", ".join(mismatched)
+    elif not found:
         status = "missing"
-    elif missing or mismatched:
+    elif missing:
         status = "partial"
     elif require_hash and hash_checked < len(found):
         status = "partial"
     else:
         status = "ok"
+
+    # simple 页缺东西时，用 JSON 再确认一次：JSON 有 → 多半是 CDN 缓存没刷
+    if status in ("missing", "partial") and mirror.json:
+        remote = json_files()
+        if remote:
+            status = "caching"
+            note = (
+                f"JSON 已有 {len(remote)} 个文件，simple 页"
+                + ("缺 " + ", ".join(missing) if missing else "尚未更新")
+                + "（CDN 缓存滞后，不是上传失败）"
+            )
 
     return MirrorResult(
         mirror.key,
@@ -473,6 +537,7 @@ def _check_one(
         missing=missing,
         mismatched=mismatched,
         hash_checked=hash_checked,
+        error=note,
         latest=latest,
         version_count=len(versions),
         versions=versions if collect_versions else [],
@@ -499,7 +564,14 @@ def check(
     with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, workers)) as pool:
         futures = [
             pool.submit(
-                _check_one, mirror, package, expected, timeout, require_hash, collect_versions
+                _check_one,
+                mirror,
+                package,
+                resolved,
+                expected,
+                timeout,
+                require_hash,
+                collect_versions,
             )
             for mirror in targets
         ]
@@ -510,7 +582,14 @@ def check(
 # ---------------------------------------------------------------- 输出
 
 
-STATUS_LABEL = {"ok": "已同步", "partial": "不完整", "missing": "缺失", "error": "错误"}
+STATUS_LABEL = {
+    "ok": "已同步",
+    "caching": "缓存中",
+    "integrity": "校验不符",
+    "partial": "不完整",
+    "missing": "缺失",
+    "error": "错误",
+}
 
 
 def render_table(report: Report) -> str:
