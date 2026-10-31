@@ -1,0 +1,37 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pypi-mirror-check"
+version = "0.1.0"
+description = "检查 PyPI 包/版本是否已同步到全球镜像，并列出各站当前最新版本（零依赖）"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+authors = [
+  { name = "bilibiliUID1480494301", email = "bilibiliUID1480494301@users.noreply.github.com" },
+]
+keywords = ["pypi", "mirror", "sync", "release", "devtools", "cli"]
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "License :: OSI Approved :: MIT License",
+  "Environment :: Console",
+  "Topic :: Software Development :: Build Tools",
+  "Topic :: System :: Networking",
+]
+dependencies = []
+
+[project.urls]
+Homepage = "https://github.com/bilibiliUID1480494301/pypi-mirror-check"
+Repository = "https://github.com/bilibiliUID1480494301/pypi-mirror-check"
+Issues = "https://github.com/bilibiliUID1480494301/pypi-mirror-check/issues"
+
+[project.scripts]
+pypi-mirror-check = "pypi_mirror_check.__main__:main_cli"
+
+[tool.setuptools]
+packages = ["pypi_mirror_check"]
+
+[tool.setuptools.package-data]
+pypi_mirror_check = ["mirrors.json"]
