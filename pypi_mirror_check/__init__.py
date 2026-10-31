@@ -298,6 +298,8 @@ class MirrorResult:
     mismatched: list[str] = field(default_factory=list)
     hash_checked: int = 0
     error: str = ""
+    # 该镜像的索引页本身是否可达（None=未探测）。用来区分「包缺失」与「镜像不可用」。
+    index_ok: bool | None = None
     # 该镜像上这个包的最新版本 / 版本总数 /（按需）全部版本
     latest: str = ""
     version_count: int = 0
@@ -333,6 +335,7 @@ class Report:
                 "missing": r.missing,
                 "mismatched": r.mismatched,
                 "hash_checked": r.hash_checked,
+                "index_ok": r.index_ok,
                 "error": r.error,
             }
             if r.versions:
@@ -347,6 +350,28 @@ class Report:
         }
 
 
+def _probe_index(mirror: Mirror, timeout: float) -> bool:
+    """只探镜像根索引是否可达（读几百字节就断开，不拉整页）。
+
+    404 有两种完全不同的含义：镜像说「我没有这个包」，或这个 simple 路径压根不对 /
+    站点下线。前者根索引是 200，后者不是——这一步就是把两者分开。
+    """
+    root = mirror.simple.split("{name}")[0]
+    if not root:
+        return False
+    request = urllib.request.Request(
+        root, headers={"User-Agent": USER_AGENT, "Range": "bytes=0-0"}
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            response.read(512)
+        return True
+    except urllib.error.HTTPError:
+        return False
+    except Exception:  # noqa: BLE001
+        return False
+
+
 def _check_one(
     mirror: Mirror,
     package: str,
@@ -359,10 +384,20 @@ def _check_one(
     try:
         body, elapsed = _fetch(url, timeout)
     except urllib.error.HTTPError as exc:
-        return MirrorResult(mirror.key, mirror.label, "missing", error=f"HTTP {exc.code}")
+        # 404/403：先看索引页在不在，能分清「无此包」与「路径不对/站点不可用」
+        index_ok = _probe_index(mirror, timeout) if exc.code in (403, 404) else None
+        status = "missing" if index_ok else "error"
+        reason = "索引可达，但无此包" if index_ok else "索引页也不可达（路径或站点问题）"
+        return MirrorResult(
+            mirror.key, mirror.label, status, error=f"HTTP {exc.code}：{reason}", index_ok=index_ok
+        )
     except Exception as exc:  # noqa: BLE001 - 单个镜像失败不该终止整轮
         return MirrorResult(
-            mirror.key, mirror.label, "error", error=f"{type(exc).__name__}: {exc}"
+            mirror.key,
+            mirror.label,
+            "error",
+            error=f"{type(exc).__name__}: {exc}",
+            index_ok=_probe_index(mirror, timeout),
         )
 
     available = parse_simple(body.decode("utf-8", "replace"))
@@ -398,6 +433,7 @@ def _check_one(
         latest=latest,
         version_count=len(versions),
         versions=versions if collect_versions else [],
+        index_ok=True,
     )
 
 

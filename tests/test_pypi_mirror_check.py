@@ -81,6 +81,8 @@ class MirrorCheckTest(unittest.TestCase):
                 "text/html",
             ),
             "/simple/boom/foo/": (500, "boom", "text/plain"),
+            # 根索引可达、但没有这个包 → 应是 missing 而不是 error
+            "/simple/pkg404/": (200, "<html></html>", "text/html"),
             "/simple/multi/foo/": (
                 200,
                 simple_html({**FILES, "foo-0.9.tar.gz": "d" * 64}),
@@ -206,6 +208,18 @@ class MirrorCheckTest(unittest.TestCase):
         self.assertIn(by["boom"].status, ("error", "missing"))
         self.assertFalse(report.ok)
         self.assertEqual(report.version, "1.0")
+
+    def test_404_distinguishes_missing_package_from_dead_index(self) -> None:
+        # 索引可达、没有包 → missing
+        missing = self.run_check([self.mirror("pkg404", "pkg404")]).results[0]
+        self.assertEqual(missing.status, "missing")
+        self.assertTrue(missing.index_ok)
+        self.assertIn("无此包", missing.error)
+        # 索引本身 404 → error（路径不对 / 站点不可用）
+        dead = self.run_check([self.mirror("dead", "dead")]).results[0]
+        self.assertEqual(dead.status, "error")
+        self.assertFalse(dead.index_ok)
+        self.assertIn("索引页", dead.error)
 
     def test_ok_report(self) -> None:
         report = self.run_check([self.mirror("ok", "ok")])

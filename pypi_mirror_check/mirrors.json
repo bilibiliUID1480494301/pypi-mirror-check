@@ -43,9 +43,9 @@
       "simple": "https://mirrors.bfsu.edu.cn/pypi/web/simple/{name}/"
     },
     {
-      "key": "sjtu",
-      "label": "上海交大",
-      "simple": "https://mirror.sjtu.edu.cn/pypi/web/simple/{name}/"
+      "key": "sjtug",
+      "label": "上海交大 SJTUG",
+      "simple": "https://mirrors.sjtug.sjtu.edu.cn/pypi/web/simple/{name}/"
     },
     {
       "key": "pku",
@@ -63,11 +63,6 @@
       "simple": "https://mirrors.sustech.edu.cn/pypi/web/simple/{name}/"
     },
     {
-      "key": "hust",
-      "label": "华中科技大学",
-      "simple": "https://mirrors.hust.edu.cn/pypi/web/simple/{name}/"
-    },
-    {
       "key": "hit",
       "label": "哈尔滨工业大学",
       "simple": "https://mirrors.hit.edu.cn/pypi/web/simple/{name}/"
@@ -78,9 +73,14 @@
       "simple": "https://mirrors.jlu.edu.cn/pypi/web/simple/{name}/"
     },
     {
-      "key": "netease",
-      "label": "网易 163",
-      "simple": "https://mirrors.163.com/pypi/simple/{name}/"
+      "key": "douban",
+      "label": "豆瓣",
+      "simple": "https://pypi.doubanio.com/simple/{name}/"
+    },
+    {
+      "key": "volces",
+      "label": "火山引擎",
+      "simple": "https://mirrors.volces.com/pypi/simple/{name}/"
     }
   ]
 }
