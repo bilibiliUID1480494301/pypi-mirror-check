@@ -45,11 +45,15 @@ __all__ = [
     "MirrorResult",
     "Report",
     "check",
+    "extract_versions",
     "load_config",
     "main",
+    "normalize_name",
     "parse_simple",
     "render_table",
     "resolve",
+    "version_from_filename",
+    "version_key",
 ]
 
 
@@ -110,8 +114,8 @@ def load_config(path: str | Path | None = None) -> Config:
     if not isinstance(raw, dict):
         raise ValueError(f"{source}: 顶层必须是对象")
     official = raw.get("official_json")
-    if not isinstance(official, str) or not official:
-        raise ValueError(f"{source}: 缺少 official_json")
+    if not isinstance(official, str) or not official.startswith(("http://", "https://")):
+        raise ValueError(f"{source}: official_json 必须是 http(s) 地址")
     items = raw.get("mirrors")
     if not isinstance(items, list) or not items:
         raise ValueError(f"{source}: mirrors 必须是非空数组")
@@ -127,6 +131,9 @@ def load_config(path: str | Path | None = None) -> Config:
             raise ValueError(f"{source}: key 缺失或重复：{key!r}")
         if "{name}" not in simple:
             raise ValueError(f"{source}: {key} 的 simple 必须含 {{name}}")
+        # 根索引探测依赖 {name} 在路径末尾；不在末尾的模板会被判成「站点不可用」。
+        if not simple.rstrip("/").endswith("{name}"):
+            raise ValueError(f"{source}: {key} 的 simple 必须以 {{name}} 结尾（尾随 / 可选）")
         seen.add(key)
         mirrors.append(
             Mirror(key=key, label=label, simple=simple, official=bool(item.get("official")))
@@ -138,10 +145,10 @@ def _add_mirror(config: Config, spec: str) -> Config:
     """--mirror key=label=url 追加/覆盖一条。"""
     parts = spec.split("=", 2)
     if len(parts) != 3 or not all(p.strip() for p in parts):
-        raise SystemExit("--mirror 需要 key=label=url 三段")
+        raise ValueError("--mirror 需要 key=label=url 三段")
     key, label, simple = (p.strip() for p in parts)
     if "{name}" not in simple:
-        raise SystemExit("--mirror 的 url 必须含 {name}")
+        raise ValueError("--mirror 的 url 必须含 {name}")
     rest = [m for m in config.mirrors if m.key != key]
     rest.append(Mirror(key=key, label=label, simple=simple))
     return Config(config.official_json, tuple(rest), config.source)
@@ -156,7 +163,13 @@ def _fetch(url: str, timeout: float, retries: int = 2) -> tuple[bytes, float]:
     for attempt in range(retries + 1):
         started = time.perf_counter()
         request = urllib.request.Request(
-            url, headers={"User-Agent": USER_AGENT, "Accept": "*/*"}
+            url,
+            headers={
+                "User-Agent": USER_AGENT,
+                # 明确要 HTML：部分镜像支持 PEP 691 JSON simple，*/* 可能拿到 JSON，
+                # 那样 HTML 解析器会一无所获，误判成「没有这个包」。
+                "Accept": "text/html,application/vnd.pypi.simple.v1+html;q=0.9,*/*;q=0.5",
+            },
         )
         try:
             with urllib.request.urlopen(request, timeout=timeout) as response:
@@ -182,7 +195,13 @@ def resolve(
     """返回 (版本, {文件名: sha256})。版本为空则取官方最新。"""
     base = official_json.rstrip("/")
     url = f"{base}/{package}/{version}/json" if version else f"{base}/{package}/json"
-    body, _ = _fetch(url, timeout)
+    try:
+        body, _ = _fetch(url, timeout)
+    except urllib.error.HTTPError as exc:
+        if exc.code == 404:
+            label = f"{package} {version}" if version else package
+            raise RuntimeError(f"官方源没有 {label}（404）") from exc
+        raise
     data = json.loads(body.decode("utf-8"))
     resolved = str(data["info"]["version"]) if version is None else version
     files: dict[str, str | None] = {}
@@ -204,19 +223,24 @@ class _SimpleParser(HTMLParser):
         super().__init__(convert_charrefs=True)
         self.links: list[tuple[str, str]] = []
         self._href: str | None = None
+        self._buf: list[str] = []
 
     def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
         if tag.lower() == "a":
             self._href = dict(attrs).get("href")
+            self._buf = []
 
     def handle_data(self, data: str) -> None:
-        if self._href is not None and data.strip():
-            self.links.append((self._href, data.strip()))
-            self._href = None
+        if self._href is not None:
+            self._buf.append(data)
 
     def handle_endtag(self, tag: str) -> None:
-        if tag.lower() == "a":
+        if tag.lower() == "a" and self._href is not None:
+            text = "".join(self._buf).strip()
+            if text:
+                self.links.append((self._href, text))
             self._href = None
+            self._buf = []
 
 
 _HASH_RE = re.compile(r"[#&]sha256=([0-9a-fA-F]{64})")
@@ -239,7 +263,9 @@ def parse_simple(html: str) -> dict[str, str | None]:
 _EXTENSIONS = (".tar.gz", ".tar.bz2", ".zip", ".whl")
 _NAME_SEP_RE = re.compile(r"[._-]+")
 _VERSION_RE = re.compile(
-    r"^(\d+(?:\.\d+)*)(?:(a|b|rc)(\d+))?(?:\.post(\d+))?(?:\.dev(\d+))?$", re.I
+    r"^(\d+(?:\.\d+)*)(?:(a|b|rc)(\d+))?(?:\.post(\d+))?(?:\.dev(\d+))?"
+    r"(?:\+([0-9A-Za-z.]+))?$",
+    re.I,
 )
 
 
@@ -265,17 +291,34 @@ def version_from_filename(filename: str, package: str) -> str | None:
 
 
 def version_key(version: str) -> tuple:
-    """够用的 PEP 440 排序键（release / a|b|rc / post / dev）。"""
+    """PEP 440 排序键：dev < a < b < rc < final < post。
+
+    之前把 dev 当成「最终版之前的修饰」会排错：`1.0.dev1` 必须小于 `1.0a1`。
+    这里用 stage 编码：dev-only=0、a=1、b=2、rc=3、final=4、post=5；
+    同一 stage 内再比序号，带 dev 的预发布/后发布排在同 stage 无 dev 之前。
+    """
     match = _VERSION_RE.match(str(version or ""))
     if not match:
-        return ((0,), 0, 0, 0, -1)
+        return ((0,), 0, 0, 0, "")
     release = tuple(int(x) for x in match.group(1).split("."))
     pre = (match.group(2) or "").lower()
-    kind = {"a": 0, "b": 1, "rc": 2, "": 3}[pre]
-    num = int(match.group(3) or 0)
+    pre_num = int(match.group(3) or 0)
     post = int(match.group(4) or 0)
     dev = int(match.group(5) or 0)
-    return (release, kind, num, post, -dev if dev else 0)
+
+    if pre:
+        stage, num = {"a": 1, "b": 2, "rc": 3}[pre], pre_num
+    elif post:
+        stage, num = 5, post
+    elif dev:
+        stage, num = 0, dev
+    else:
+        stage, num = 4, 0
+
+    # 带 dev 的 a/b/rc/post 排在同 stage 的非 dev 之前
+    dev_flag = -1 if (dev and stage in (1, 2, 3, 5)) else 0
+    local = match.group(6) or ""  # PEP 440 local：+cu118 这类，排在同版本号基础版之后
+    return (release, stage, num, dev_flag, local)
 
 
 def extract_versions(filenames: Iterable[str], package: str) -> list[str]:
@@ -512,6 +555,9 @@ def build_parser() -> argparse.ArgumentParser:
         prog="pypi-mirror-check",
         description="检查指定 PyPI 包/版本是否已同步到全球镜像（文件名 + sha256 比对）。",
     )
+    parser.add_argument(
+        "--version", action="version", version=f"%(prog)s {__version__}"
+    )
     parser.add_argument("package", nargs="?", help="包名，如 hubrelay")
     parser.add_argument("version", nargs="?", help="版本；省略则查官方最新版")
     parser.add_argument("--json", action="store_true", help="输出 JSON")
@@ -545,8 +591,9 @@ def _select_mirrors(config: Config, only: str) -> list[Mirror]:
     by_key = {m.key: m for m in config.mirrors}
     unknown = [k for k in keys if k not in by_key]
     if unknown:
-        raise SystemExit(f"未知镜像：{', '.join(unknown)}（--list-mirrors 查看）")
+        raise ValueError(f"未知镜像：{', '.join(unknown)}（--list-mirrors 查看）")
     return [by_key[k] for k in keys]
+
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -561,8 +608,13 @@ def main(argv: Sequence[str] | None = None) -> int:
     except (OSError, ValueError, json.JSONDecodeError) as exc:
         print(f"读取镜像配置失败：{exc}", file=sys.stderr)
         return 2
-    for spec in args.mirror:
-        config = _add_mirror(config, spec)
+    try:
+        for spec in args.mirror:
+            config = _add_mirror(config, spec)
+    except ValueError as exc:
+        print(f"--mirror 有误：{exc}", file=sys.stderr)
+        return 2
+
     official = args.official or config.official_json
 
     if args.list_mirrors:
@@ -575,7 +627,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         build_parser().print_help()
         return 2
 
-    mirrors = _select_mirrors(config, args.only)
+    try:
+        mirrors = _select_mirrors(config, args.only)
+    except ValueError as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
+
     deadline = time.monotonic() + max(0.0, args.timeout)
 
     while True:
@@ -595,9 +652,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             print(f"无法解析官方发布信息：{type(exc).__name__}: {exc}", file=sys.stderr)
             return 2
 
-        if args.json:
-            print(json.dumps(report.to_json(), ensure_ascii=False, indent=2))
-        else:
+        if not args.json:
             print(render_table(report))
             print(_summary(report))
             if args.all_versions:
@@ -606,9 +661,17 @@ def main(argv: Sequence[str] | None = None) -> int:
                     if r.versions:
                         print(f"  {r.label}（{r.version_count}）: {', '.join(r.versions)}")
 
-        if report.ok or not args.wait:
+        # 轮询时只在结束时输出一次 JSON：每轮都打会拼成非法的 JSON 流。
+        timed_out = (
+            args.wait
+            and not report.ok
+            and time.monotonic() + args.interval > deadline
+        )
+        if report.ok or not args.wait or timed_out:
+            if args.json:
+                print(json.dumps(report.to_json(), ensure_ascii=False, indent=2))
+            if timed_out:
+                print(f"等待超时（{int(args.timeout)}s），仍有镜像未同步", file=sys.stderr)
+                return 3
             return 0 if report.ok else 1
-        if time.monotonic() + args.interval > deadline:
-            print(f"等待超时（{int(args.timeout)}s），仍有镜像未同步", file=sys.stderr)
-            return 3
         time.sleep(args.interval)

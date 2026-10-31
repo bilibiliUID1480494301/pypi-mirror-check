@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import io
 import json
 import sys
 import tempfile
@@ -145,6 +146,29 @@ class MirrorCheckTest(unittest.TestCase):
             with self.assertRaises(ValueError):
                 pmc.load_config(bad)
 
+    def test_config_rejects_bad_official_and_name_position(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            bad_official = Path(tmp) / "a.json"
+            bad_official.write_text(
+                json.dumps({"official_json": "ftp://x", "mirrors": [{"key": "a", "simple": "http://m/{name}/"}]}),
+                encoding="utf-8",
+            )
+            with self.assertRaises(ValueError):
+                pmc.load_config(bad_official)
+
+            bad_pos = Path(tmp) / "b.json"
+            bad_pos.write_text(
+                json.dumps(
+                    {
+                        "official_json": "http://x",
+                        "mirrors": [{"key": "a", "simple": "http://m/{name}/sub/"}],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            with self.assertRaises(ValueError):
+                pmc.load_config(bad_pos)
+
     def test_add_mirror_override(self) -> None:
         cfg = pmc.load_config()
         merged = pmc._add_mirror(cfg, "tuna=TUNA=http://m/{name}/")
@@ -178,6 +202,62 @@ class MirrorCheckTest(unittest.TestCase):
         self.assertEqual(
             sorted(versions, key=pmc.version_key), ["0.9.9", "0.9.10", "1.0rc1", "1.0"]
         )
+
+    def test_local_version(self) -> None:
+        self.assertEqual(
+            pmc.version_from_filename("torch-2.1.0+cu118-cp311-cp311-win_amd64.whl", "torch"),
+            "2.1.0+cu118",
+        )
+        self.assertEqual(
+            sorted(["1.0", "1.0+cu118"], key=pmc.version_key), ["1.0", "1.0+cu118"]
+        )
+
+    def test_wait_json_prints_single_document(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = Path(tmp) / "c.json"
+            cfg.write_text(
+                json.dumps(
+                    {
+                        "official_json": self.base + "/pypi",
+                        "mirrors": [
+                            {"key": "m", "label": "M", "simple": self.base + "/simple/missing/{name}/"}
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            buf = io.StringIO()
+            old = sys.stdout
+            sys.stdout = buf
+            try:
+                code = pmc.main(
+                    ["--config", str(cfg), "foo", "1.0", "--wait", "--timeout", "0", "--json"]
+                )
+            finally:
+                sys.stdout = old
+            self.assertEqual(code, 3)
+            payload = json.loads(buf.getvalue())  # 必须是单个合法 JSON，不是多段拼接
+            self.assertEqual(payload["version"], "1.0")
+            self.assertFalse(payload["ok"])
+
+    def test_version_key_orders_dev_before_pre(self) -> None:
+        versions = ["1.0.post1", "1.0", "1.0a1", "1.0a1.dev1", "1.0.dev1"]
+        self.assertEqual(
+            sorted(versions, key=pmc.version_key),
+            ["1.0.dev1", "1.0a1.dev1", "1.0a1", "1.0", "1.0.post1"],
+        )
+
+    def test_parse_simple_handles_nested_tags(self) -> None:
+        html = '<a href="/f/foo-1.0.tar.gz#sha256=' + SHA_TAR + '"><span>foo-1.0.tar.gz</span></a>'
+        self.assertEqual(pmc.parse_simple(html), {"foo-1.0.tar.gz": SHA_TAR})
+
+    def test_cli_only_unknown_returns_2(self) -> None:
+        self.assertEqual(pmc.main(["--only", "nope", "foo"]), 2)
+
+    def test_cli_version_flag(self) -> None:
+        with self.assertRaises(SystemExit) as ctx:
+            pmc.main(["--version"])
+        self.assertEqual(ctx.exception.code, 0)
 
     def test_latest_and_all_versions(self) -> None:
         mirror = self.mirror("multi", "multi")

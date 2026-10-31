@@ -28,6 +28,7 @@ pypi-mirror-check <package> [version] [options]
 | `--mirror KEY=LABEL=URL` | 临时追加/覆盖一个镜像（可重复，URL 需含 `{name}`） |
 | `--official URL` | 覆盖官方 JSON 基址 |
 | `--list-mirrors` | 打印当前配置来源与镜像表 |
+| `--version` | 打印版本（从 pyproject / 包元数据探测） |
 
 ## 输出
 
